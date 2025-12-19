@@ -116,7 +116,7 @@ Frontend runs on: `http://localhost:3000`
 
 ## 🏗️ Project Structure
 
-\`\`\`
+
 image-matcher/
 ├── server.py                 # Flask backend server
 ├── explainable_matcher.py    # CLIP + explainability logic
@@ -136,7 +136,7 @@ image-matcher/
     │   ├── App.css
     │   └── index.js
     └── package.json
-\`\`\`
+
 
 ## 🔑 API Endpoints
 
