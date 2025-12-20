@@ -1,13 +1,14 @@
 import torch
 import open_clip
 from typing import List, Dict
-import re
+import os
+from openai import OpenAI
 
 class ExplainableImageMatcher:
     """
     Hybrid explainable image-text matching.
     Uses original CLIP cosine similarity as the final score,
-    but provides detailed explanations via feature decomposition.
+    but provides detailed explanations via feature decomposition using GPT.
     """
     
     def __init__(self, model, tokenizer, preprocess, device):
@@ -16,83 +17,114 @@ class ExplainableImageMatcher:
         self.preprocess = preprocess
         self.device = device
         
+        # Initialize OpenAI client
+        api_key = os.getenv('OPENAI_API_KEY')
+        if not api_key:
+            print("⚠️  WARNING: OPENAI_API_KEY not found. Feature extraction will use fallback method.")
+            self.client = None
+        else:
+            self.client = OpenAI(api_key=api_key)
+        
         # Similarity thresholds for categorization
         self.STRONG_THRESHOLD = 0.45
         self.PARTIAL_THRESHOLD = 0.25
         
     def decompose_prompt(self, prompt: str) -> List[Dict[str, any]]:
         """
-        Decompose a long interior design prompt into semantic units.
+        Use GPT to decompose a prompt into semantic features.
         Returns list of dicts with keys: 'feature', 'category'
         """
+        if not self.client:
+            return self._fallback_decomposition(prompt)
+        
+        try:
+            response = self.client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": """You are an expert at analyzing interior design prompts. 
+Extract key visual features from the given prompt and categorize them.
+
+Categories:
+- style: overall design style (modern, rustic, minimalist, etc.)
+- layout: spatial arrangement (open concept, island, L-shaped, etc.)
+- material: materials and colors (wood, marble, sage green, etc.)
+- lighting: lighting features (pendant lights, natural light, LED, etc.)
+- fixtures: appliances and fixtures (stainless steel appliances, farmhouse sink, etc.)
+- photography: photo characteristics (wide-angle, close-up, etc.)
+- general: anything else important
+
+Return ONLY a JSON array of objects with 'feature' and 'category' keys.
+Each feature should be a short, specific phrase (3-8 words).
+Example: [{"feature": "modern minimalist kitchen", "category": "style"}, {"feature": "sage green lower cabinets", "category": "material"}]"""
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Extract visual features from this prompt: {prompt}"
+                    }
+                ],
+                temperature=0.3,
+                max_tokens=500
+            )
+            
+            # Parse GPT response
+            import json
+            features_text = response.choices[0].message.content.strip()
+            
+            # Clean up response if it has markdown code blocks
+            if features_text.startswith('```'):
+                features_text = features_text.split('```')[1]
+                if features_text.startswith('json'):
+                    features_text = features_text[4:]
+                features_text = features_text.strip()
+            
+            features = json.loads(features_text)
+            
+            print(f"✓ GPT extracted {len(features)} features from prompt")
+            return features
+            
+        except Exception as e:
+            print(f"⚠️  GPT extraction failed: {e}. Using fallback method.")
+            return self._fallback_decomposition(prompt)
+    
+    def _fallback_decomposition(self, prompt: str) -> List[Dict[str, any]]:
+        """
+        Simple fallback method if GPT is unavailable.
+        Splits prompt into chunks by commas and conjunctions.
+        """
+        import re
+        
         features = []
         
-        # Pattern-based extraction for common interior design features
-        style_patterns = [
-            r'(modern|contemporary|traditional|rustic|industrial|minimalist|scandinavian|farmhouse|elegant|luxury|cozy)[\s\w]*(?:kitchen|interior|design|style)',
-            r'(open\s+concept|spacious|compact|bright)',
-        ]
+        # Split by common delimiters
+        chunks = re.split(r',|\s+and\s+|\s+with\s+', prompt)
         
-        layout_patterns = [
-            r'([ULI]-shaped|galley|peninsula|island)[\s\w]*(?:kitchen|layout)',
-            r'(breakfast\s+counter|dining\s+area|bar\s+seating|kitchen\s+island)',
-        ]
+        for chunk in chunks:
+            chunk = chunk.strip()
+            if len(chunk) > 5:  # Ignore very short chunks
+                # Try to categorize based on keywords
+                chunk_lower = chunk.lower()
+                
+                if any(word in chunk_lower for word in ['modern', 'rustic', 'minimalist', 'contemporary', 'traditional', 'elegant']):
+                    category = 'style'
+                elif any(word in chunk_lower for word in ['cabinet', 'countertop', 'backsplash', 'wood', 'marble', 'granite', 'stone']):
+                    category = 'material'
+                elif any(word in chunk_lower for word in ['light', 'lighting', 'pendant', 'chandelier', 'led']):
+                    category = 'lighting'
+                elif any(word in chunk_lower for word in ['island', 'layout', 'open concept', 'shaped']):
+                    category = 'layout'
+                elif any(word in chunk_lower for word in ['appliance', 'sink', 'faucet', 'oven', 'refrigerator']):
+                    category = 'fixtures'
+                else:
+                    category = 'general'
+                
+                features.append({
+                    'feature': chunk,
+                    'category': category
+                })
         
-        material_patterns = [
-            r'(sage\s+green|white|black|grey|gray|navy|blue|beige|cream|brown|wooden|marble|granite|quartz|stone|stainless\s+steel)[\s\w]*(?:cabinets?|countertops?|backsplash|flooring|walls?)',
-            r'(upper|lower)[\s\w]*cabinets?.*?(glass|wooden|open|closed|shaker|flat-panel)',
-        ]
-        
-        lighting_patterns = [
-            r'(warm|cool|natural|LED|pendant|recessed|track|ambient)[\s\w]*lighting',
-            r'(chandelier|pendant\s+lights?|under-cabinet\s+lighting|ceiling\s+lights?)',
-        ]
-        
-        fixture_patterns = [
-            r'(stainless\s+steel|black|white|matte)[\s\w]*(?:appliances?|refrigerator|oven|stove|range|sink|faucet)',
-            r'(farmhouse|undermount|double|single)[\s\w]*sink',
-        ]
-        
-        photo_patterns = [
-            r'(wide-angle|close-up|panoramic|aerial)[\s\w]*(?:shot|view|photo|perspective)',
-            r'(interior\s+photography|architectural\s+shot)',
-        ]
-        
-        pattern_configs = [
-            (style_patterns, 'style'),
-            (layout_patterns, 'layout'),
-            (material_patterns, 'material'),
-            (lighting_patterns, 'lighting'),
-            (fixture_patterns, 'fixtures'),
-            (photo_patterns, 'photography'),
-        ]
-        
-        prompt_lower = prompt.lower()
-        seen_features = set()
-        
-        for patterns, category in pattern_configs:
-            for pattern in patterns:
-                matches = re.finditer(pattern, prompt_lower, re.IGNORECASE)
-                for match in matches:
-                    feature_text = match.group(0).strip()
-                    if feature_text not in seen_features and len(feature_text) > 5:
-                        features.append({
-                            'feature': feature_text,
-                            'category': category
-                        })
-                        seen_features.add(feature_text)
-        
-        # If no patterns matched, create general semantic chunks
-        if not features:
-            chunks = re.split(r'[,.]', prompt)
-            for chunk in chunks:
-                chunk = chunk.strip()
-                if len(chunk) > 10:
-                    features.append({
-                        'feature': chunk,
-                        'category': 'general'
-                    })
-        
+        print(f"✓ Fallback method extracted {len(features)} features")
         return features
     
     def compute_feature_similarities(self, image_embedding: torch.Tensor, 
@@ -213,7 +245,7 @@ class ExplainableImageMatcher:
             original_similarity = (image_embedding @ text_embedding.T).squeeze()
             original_score = original_similarity.item() * 100
         
-        # Decompose prompt for explanation
+        # Decompose prompt using GPT
         features = self.decompose_prompt(prompt)
         
         # Compute feature similarities (for explanation only)

@@ -7,7 +7,7 @@ import io
 import os
 from dotenv import load_dotenv
 from explainable_matcher import ExplainableImageMatcher
-from mongo_models import MongoDB
+from postgres_models import db, PostgresDB
 
 # Load environment variables
 load_dotenv()
@@ -19,10 +19,21 @@ CORS(app)
 # Configuration
 UPLOAD_FOLDER = 'uploads'
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 
-# Initialize MongoDB with connection string from .env
-mongo_db = MongoDB(uri=os.getenv('MONGODB_URI'), upload_folder=UPLOAD_FOLDER)
+# PostgreSQL Configuration
+# Use environment variable or default to SQLite for local development
+DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///image_matcher.db')
+
+# Fix for Render/Railway (they use postgres:// but SQLAlchemy needs postgresql://)
+if DATABASE_URL.startswith('postgres://'):
+    DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
+
+app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# Initialize PostgreSQL
+postgres_db = PostgresDB(app=app, upload_folder=UPLOAD_FOLDER)
 
 # --- Model Setup (Load once at startup) ---
 print("--- Starting Model Setup ---")
@@ -62,7 +73,7 @@ def login():
     if not login_id:
         return jsonify({'error': 'Login ID cannot be empty'}), 400
     
-    user = mongo_db.create_or_get_user(login_id)
+    user = postgres_db.create_or_get_user(login_id)
     
     return jsonify({
         'message': 'Login successful',
@@ -73,10 +84,11 @@ def login():
 @app.route('/api/auth/check/<login_id>', methods=['GET'])
 def check_user(login_id):
     """Check if user exists"""
-    user = mongo_db.users.find_one({'login_id': login_id})
+    from postgres_models import User
+    user = User.query.filter_by(login_id=login_id).first()
     
     if user:
-        return jsonify({'exists': True, 'user': mongo_db._format_user(user)}), 200
+        return jsonify({'exists': True, 'user': user.to_dict()}), 200
     else:
         return jsonify({'exists': False}), 404
 
@@ -128,7 +140,7 @@ def explain_match():
 
     image_file = request.files['image']
     prompt_text = request.form['prompt']
-    user_id = request.form.get('user_id')  # Optional: store if user is logged in
+    user_id = request.form.get('user_id')
 
     try:
         image_bytes = image_file.read()
@@ -137,11 +149,11 @@ def explain_match():
         # Get explainable results
         result = explainer.explain_match(image, prompt_text)
         
-        # If user is logged in, save to database and file system
+        # If user is logged in, save to database
         if user_id:
-            user = mongo_db.get_user_by_id(user_id)
+            user = postgres_db.get_user_by_id(user_id)
             if user:
-                match_id = mongo_db.save_match(
+                match_id = postgres_db.save_match(
                     user_id=user_id,
                     prompt=prompt_text,
                     image_bytes=image_bytes,
@@ -168,12 +180,12 @@ def explain_match():
 @app.route('/api/history/<user_id>', methods=['GET'])
 def get_user_history(user_id):
     """Get match history for a user"""
-    user = mongo_db.get_user_by_id(user_id)
+    user = postgres_db.get_user_by_id(user_id)
     
     if not user:
         return jsonify({'error': 'User not found'}), 404
     
-    matches = mongo_db.get_user_matches(user_id)
+    matches = postgres_db.get_user_matches(user_id)
     
     return jsonify({
         'user': user,
@@ -184,7 +196,7 @@ def get_user_history(user_id):
 @app.route('/api/history/match/<match_id>', methods=['GET'])
 def get_match_detail(match_id):
     """Get detailed information about a specific match"""
-    match = mongo_db.get_match_by_id(match_id)
+    match = postgres_db.get_match_by_id(match_id)
     
     if not match:
         return jsonify({'error': 'Match not found'}), 404
@@ -195,7 +207,7 @@ def get_match_detail(match_id):
 @app.route('/api/history/match/<match_id>', methods=['DELETE'])
 def delete_match(match_id):
     """Delete a match from history"""
-    success = mongo_db.delete_match(match_id)
+    success = postgres_db.delete_match(match_id)
     
     if not success:
         return jsonify({'error': 'Match not found or deletion failed'}), 404
